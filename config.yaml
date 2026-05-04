@@ -1,0 +1,53 @@
+# ── Scholarship Assistant — Central Configuration ─────────────────────────────
+# All tunable values live here. No hardcoded constants in any Python file.
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+scholarship_dir: "./scholarship"
+db_path: "./scholarship_assistant.db"
+
+# ── Ollama ─────────────────────────────────────────────────────────────────────
+ollama_model: "qwen2.5:7b-instruct"
+
+# ── Embeddings ─────────────────────────────────────────────────────────────────
+embed_model: "all-MiniLM-L6-v2"
+
+# ── RAG chunking ───────────────────────────────────────────────────────────────
+chunk_words: 110
+chunk_overlap: 20
+rag_top_k: 4
+
+# ── LLM token budgets ──────────────────────────────────────────────────────────
+router_max_tokens: 450
+answer_max_tokens: 1024
+
+# ── Fuzzy matching ─────────────────────────────────────────────────────────────
+fuzzy_match_threshold: 60
+
+# ── CSV column aliases ─────────────────────────────────────────────────────────
+# Maps any alternative column header found in the CSV → canonical internal name.
+# Add new entries here if a future CSV uses different headers.
+column_aliases:
+  scholarship_name: name
+  title: name
+  cgpa_requirement: gpa_min
+  cgpa_min: gpa_min
+  min_cgpa: gpa_min
+  min_gpa: gpa_min
+  basis: funding_type
+  type: funding_type
+  text_file_path: txt_file
+  file_path: txt_file
+  txt_path: txt_file
+
+# ── Optional column defaults ───────────────────────────────────────────────────
+# Injected when the CSV is missing these columns entirely.
+optional_defaults:
+  level: "any"
+  field: "any"
+  country: "Pakistan"
+  amount_pkr: null
+  domicile: "any"
+  status: "active"
+  funding_type: "any"
+  gpa_min: 0.0
+  txt_file: null
