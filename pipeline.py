@@ -27,6 +27,19 @@ Fixes in this version:
      dataframe columns so it never shows "N/A" for every column when the CSV
      uses non-standard names. All columns present in the row are displayed
      using their actual column name as label if no friendly name is defined.
+
+Changes in this version (anti-hallucination):
+  4. execute_plan() RAG branch — CSV fallback completely removed.
+     When rag_engine.retrieve() returns no hits (or hits exist but total
+     content is < 500 characters), a direct_answer is set immediately and
+     the LLM is never called. This prevents the model from hallucinating
+     when retrieved context is absent or too thin to be reliable.
+     Execution log now records hybrid_search flag, hit count, and whether
+     the sparse-evidence guard was triggered.
+
+  5. generate_final_answer() — direct_answer short-circuit was already in
+     place; verified it fires before any LLM call when direct_answer is set.
+     Also fires when evidence_parts is empty, returning a static fallback.
 """
 
 from __future__ import annotations
@@ -478,33 +491,49 @@ def execute_plan(
 
         hits = rag_engine.retrieve(user_query, top_k=_RAG_TOP_K, scholarship_names=filter_names)
         execution_log.append({
-            "step": "rag_retrieve", "hits": len(hits), "filter_names": filter_names,
+            "step":         "rag_retrieve",
+            "hits":         len(hits),
+            "filter_names": filter_names,
+            "hybrid_search": True,
         })
 
-        if hits:
-            by_name: dict[str, list[str]] = {}
-            for hit in hits:
-                by_name.setdefault(hit["scholarship_name"], []).append(hit["content"])
-            for name, chunks in by_name.items():
-                evidence_parts.append({
-                    "source_type": "rag",
-                    "content":     f"[{name}]\n" + "\n---\n".join(chunks),
-                    "raw":         {"name": name},
-                })
-        else:
-            df_src = (
-                sch_index.df if not filter_names
-                else sch_index.df[sch_index.df["name"].isin(filter_names)]
-            )
-            for _, row in df_src.head(5).iterrows():
-                evidence_parts.append({
-                    "source_type": "csv_fallback",
-                    "content":     sch_index.to_summary_string(row),
-                    "raw":         {},
-                })
+        # ── No-evidence message (used by both guards below) ────────────────────
+        _NO_EVIDENCE_MSG = (
+            "I don't have detailed information about that in my database. "
+            "Try asking about a specific scholarship by name, or rephrase your question."
+        )
+
+        if not hits:
+            # No chunks passed the hybrid score threshold — do NOT send CSV
+            # summaries as evidence; that causes hallucination.
+            direct_answer = _NO_EVIDENCE_MSG
             execution_log.append({
-                "step": "rag_fallback", "note": "no RAG hits — used CSV summaries",
+                "step": "rag_no_hits",
+                "note": "no chunks above min_score threshold — LLM skipped",
             })
+        else:
+            # ── Sparse-evidence safeguard ──────────────────────────────────────
+            # If the total retrieved content is too thin (< 500 chars) the LLM
+            # has nothing meaningful to ground on and will hallucinate details.
+            # Return a direct answer instead of calling the LLM.
+            total_content_len = sum(len(h["content"]) for h in hits)
+            if total_content_len < 500:
+                direct_answer = _NO_EVIDENCE_MSG
+                execution_log.append({
+                    "step":      "rag_sparse_evidence",
+                    "note":      f"total content {total_content_len} chars < 500 threshold",
+                    "triggered": True,
+                })
+            else:
+                by_name: dict[str, list[str]] = {}
+                for hit in hits:
+                    by_name.setdefault(hit["scholarship_name"], []).append(hit["content"])
+                for name, chunks in by_name.items():
+                    evidence_parts.append({
+                        "source_type": "rag",
+                        "content":     f"[{name}]\n" + "\n---\n".join(chunks),
+                        "raw":         {"name": name},
+                    })
 
     return {
         "evidence_parts": evidence_parts,
