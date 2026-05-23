@@ -16,6 +16,24 @@ chunk_words: 110
 chunk_overlap: 20
 rag_top_k: 4
 
+# ── RAG retrieval quality ──────────────────────────────────────────────────────
+# Minimum hybrid score (0.6 * semantic + 0.4 * bm25_normalized) a chunk must
+# achieve to be included in the evidence passed to the LLM.
+# Chunks below this threshold are discarded — LLM never sees them.
+#
+# Tuning guide:
+#   0.25 → more permissive, higher recall, slight hallucination risk
+#   0.30 → recommended starting point (default)
+#   0.35 → stricter, fewer hits — raise here if still hallucinating
+#   0.40 → very strict, use only when all txt files have full coverage
+rag_min_score: 0.30
+
+# Set to true to print per-query debug info to stdout during development:
+#   [rag_retrieve] candidates=N min_hybrid=X max_hybrid=Y threshold=Z bm25_max=W
+#   [rag_retrieve] hits_after_filter=N
+# Always keep false in production.
+debug_rag: false
+
 # ── LLM token budgets ──────────────────────────────────────────────────────────
 router_max_tokens: 450
 answer_max_tokens: 1024
