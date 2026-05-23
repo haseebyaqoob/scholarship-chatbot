@@ -17,6 +17,18 @@ Fixes applied vs original:
     provided. The original fixed pool (top_k * 6) could be exhausted before collecting
     top_k results from a narrow whitelist (e.g., 2 scholarships), silently returning
     fewer hits than requested. Pool is now top_k * 20 (min 50) when filtering.
+
+Changes in this version (hybrid search + score threshold):
+  - BM25 index (rank_bm25.BM25Okapi) built alongside FAISS in _build_index().
+  - retrieve() now performs hybrid search:
+      * Candidate pool = union of top FAISS indices and top BM25 indices.
+      * Hybrid score   = 0.6 * semantic_score + 0.4 * bm25_normalized_score.
+      * BM25 normalization guard: divide by bm25_max only when bm25_max > 1.0;
+        when bm25_max <= 1.0 raw scores are used as-is; division by zero is guarded.
+  - min_score parameter added to retrieve() (read from config key rag_min_score,
+    fallback 0.30). Chunks with hybrid_score < min_score are discarded.
+  - Optional debug logging controlled by config key debug_rag (bool, default false).
+  - Return schema of retrieve() is unchanged.
 """
 
 from __future__ import annotations
@@ -28,6 +40,7 @@ from typing import Optional
 import faiss
 import numpy as np
 import pandas as pd
+from rank_bm25 import BM25Okapi
 from rapidfuzz import fuzz, process as rfprocess
 from sentence_transformers import SentenceTransformer
 
@@ -42,6 +55,7 @@ _RAG_TOP_K         = int(cfg["rag_top_k"])
 _FUZZY_THRESHOLD   = int(cfg["fuzzy_match_threshold"])
 _COLUMN_ALIASES    = cfg.get("column_aliases", {})
 _OPTIONAL_DEFAULTS = cfg.get("optional_defaults", {})
+_RAG_MIN_SCORE     = float(cfg.get("rag_min_score", 0.30))
 
 
 # ── Chunk dataclass for RAG ────────────────────────────────────────────────────
@@ -239,9 +253,16 @@ class ScholarshipIndex:
 
 class RAGEngine:
     """
-    Sentence-transformer + FAISS semantic search over scholarship documents.
+    Sentence-transformer + FAISS semantic search over scholarship documents,
+    combined with BM25 keyword search for hybrid retrieval.
+
     Each scholarship gets one or more chunks from its txt file (or a CSV summary
     fallback if no txt is available).
+
+    Hybrid retrieval:
+      - Candidate pool  = union of top-FAISS indices and top-BM25 indices.
+      - Hybrid score    = 0.6 * semantic_score + 0.4 * bm25_normalized_score.
+      - min_score gate  = discard chunks below the hybrid score threshold.
     """
 
     def __init__(
@@ -253,6 +274,7 @@ class RAGEngine:
         self.model      = SentenceTransformer(embed_model_name)
         self.sch_index  = scholarship_index
         self.faiss_index: Optional[faiss.IndexFlatIP] = None
+        self.bm25: Optional[BM25Okapi] = None
         self.chunks: list[Chunk] = []
         self._build_index()
 
@@ -324,6 +346,11 @@ class RAGEngine:
         self.chunks = all_chunks
         print(f"[rag_init] FAISS index built — {len(all_chunks)} chunks, dim={dim}")
 
+        # ── BM25 index (built after chunks are finalised) ──────────────────────
+        tokenized_corpus = [c.content.lower().split() for c in all_chunks]
+        self.bm25 = BM25Okapi(tokenized_corpus)
+        print(f"[rag_init] BM25 index built — {len(all_chunks)} chunks")
+
     # ── Retrieval ──────────────────────────────────────────────────────────────
 
     def retrieve(
@@ -331,24 +358,37 @@ class RAGEngine:
         query: str,
         top_k: int = _RAG_TOP_K,
         scholarship_names: list[str] | None = None,
+        min_score: float | None = None,
     ) -> list[dict]:
         """
-        Return top_k most relevant chunks.
-        If scholarship_names is given, restrict results to those scholarships only.
+        Return top_k most relevant chunks using hybrid search (FAISS + BM25).
 
-        Fix vs original:
-        When a scholarship_names whitelist is provided the search pool is enlarged
-        to top_k * 20 (min 50). The original top_k * 6 pool could be exhausted
-        before finding top_k results from a narrow whitelist (e.g. 2 scholarships),
-        silently returning fewer hits than requested and degrading answer quality.
+        If scholarship_names is given, restrict results to those scholarships only.
+        Chunks with a hybrid score below min_score are discarded entirely.
+
+        Hybrid scoring:
+          hybrid_score = 0.6 * semantic_score + 0.4 * bm25_normalized_score
+
+        BM25 normalization guard:
+          - If bm25_max > 1.0:  normalize by dividing by bm25_max  → [0, 1]
+          - If bm25_max in (0, 1]: keep raw scores as-is (already low range)
+          - If bm25_max == 0:    set all BM25 contributions to 0.0
+
+        Candidate pool optimization:
+          Only the union of top FAISS and top BM25 indices is scored,
+          avoiding full-corpus BM25 computation.
         """
         if self.faiss_index is None or not self.chunks:
             return []
+
+        if min_score is None:
+            min_score = _RAG_MIN_SCORE
 
         query_vec = np.array(
             self.model.encode([query], normalize_embeddings=True), dtype="float32"
         )
 
+        # ── Candidate pool size ────────────────────────────────────────────────
         # Use a larger pool when filtering by a specific scholarship whitelist.
         # With a narrow whitelist most globally top-ranked chunks belong to other
         # scholarships and are discarded, so we need to cast a wider net.
@@ -357,13 +397,61 @@ class RAGEngine:
         else:
             search_k = min(max(top_k * 6, 10), len(self.chunks))
 
-        scores, indices = self.faiss_index.search(query_vec, search_k)
+        # ── FAISS semantic retrieval ───────────────────────────────────────────
+        faiss_scores_raw, faiss_indices_raw = self.faiss_index.search(query_vec, search_k)
+        faiss_scores: dict[int, float] = {}
+        for score, idx in zip(faiss_scores_raw[0], faiss_indices_raw[0]):
+            if idx >= 0:
+                faiss_scores[int(idx)] = float(score)
 
-        seen_ids: set[str]   = set()
-        results: list[dict]  = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx < 0:
-                continue
+        # ── BM25 keyword retrieval ─────────────────────────────────────────────
+        query_tokens    = query.lower().split()
+        bm25_scores_all = np.array(self.bm25.get_scores(query_tokens))
+        # Get top search_k BM25 indices (without iterating over all documents at query time)
+        bm25_top_raw    = np.argpartition(bm25_scores_all, -min(search_k, len(bm25_scores_all)))[
+            -min(search_k, len(bm25_scores_all)):
+        ]
+        bm25_top_indices: set[int] = set(int(i) for i in bm25_top_raw)
+
+        # ── Union of candidate pools ───────────────────────────────────────────
+        candidate_indices: set[int] = set(faiss_scores.keys()) | bm25_top_indices
+
+        # ── BM25 normalization guard ───────────────────────────────────────────
+        candidate_bm25_raw = {i: float(bm25_scores_all[i]) for i in candidate_indices}
+        bm25_max           = max(candidate_bm25_raw.values()) if candidate_bm25_raw else 0.0
+
+        if bm25_max > 1.0:
+            # Normalize to [0, 1]
+            bm25_norm: dict[int, float] = {i: s / bm25_max for i, s in candidate_bm25_raw.items()}
+        elif bm25_max == 0.0:
+            # All BM25 scores are 0 — no keyword signal
+            bm25_norm = {i: 0.0 for i in candidate_indices}
+        else:
+            # bm25_max in (0, 1] — raw scores are already in a low range, keep as-is
+            bm25_norm = candidate_bm25_raw
+
+        # ── Hybrid scoring ─────────────────────────────────────────────────────
+        hybrid_scores: dict[int, float] = {
+            idx: 0.6 * faiss_scores.get(idx, 0.0) + 0.4 * bm25_norm.get(idx, 0.0)
+            for idx in candidate_indices
+        }
+
+        # ── Debug logging (controlled by config key debug_rag) ─────────────────
+        if cfg.get("debug_rag") and hybrid_scores:
+            vals = list(hybrid_scores.values())
+            print(
+                f"[rag_retrieve] candidates={len(candidate_indices)} "
+                f"min_hybrid={min(vals):.3f} max_hybrid={max(vals):.3f} "
+                f"threshold={min_score:.3f} bm25_max={bm25_max:.3f}"
+            )
+
+        # ── Filter, rank, deduplicate, return ─────────────────────────────────
+        seen_ids: set[str]  = set()
+        results: list[dict] = []
+
+        for idx, score in sorted(hybrid_scores.items(), key=lambda x: x[1], reverse=True):
+            if score < min_score:
+                break  # sorted descending — everything after is also below threshold
             chunk = self.chunks[idx]
             if scholarship_names and chunk.scholarship_name not in scholarship_names:
                 continue
@@ -373,10 +461,13 @@ class RAGEngine:
             results.append({
                 "scholarship_name": chunk.scholarship_name,
                 "chunk_id":         chunk.chunk_id,
-                "score":            float(score),
+                "score":            score,
                 "content":          chunk.content,
             })
             if len(results) >= top_k:
                 break
+
+        if cfg.get("debug_rag"):
+            print(f"[rag_retrieve] hits_after_filter={len(results)}")
 
         return results
