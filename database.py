@@ -1,19 +1,3 @@
-"""
-database.py
-───────────
-SQLite-backed user profile and chat-history store.
-
-Changes vs original:
-  - set_pending_updates() now stores an expiry timestamp alongside the data.
-    Pending updates automatically expire after PENDING_TTL_SECONDS (default 30
-    minutes). This prevents a confirmation prompt from a previous session from
-    silently intercepting the user's first message in a new session — a real
-    production bug when the user closes the browser mid-confirmation.
-  - get_pending_updates() is backward-compatible: it handles both the old
-    plain-dict format and the new {data, expires_at} format. Old rows are
-    returned as-is; new rows are TTL-checked and auto-cleared on expiry.
-  - Everything else is unchanged.
-"""
 
 import json
 import sqlite3
