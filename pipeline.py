@@ -1,46 +1,4 @@
-"""
-pipeline.py
-───────────
-Combines:
-  - System A: user-profile management, session handling, confirmation flow
-  - System B: router → execute_plan → generate_final_answer architecture
 
-Fixes in this version:
-  1. compare operation crash: "['name'] not in index"
-     Root cause: run_csv_query applied the `fields` column selection BEFORE
-     the compare branch ran. If `fields` was non-empty it dropped the 'name'
-     column, then the compare branch tried to filter by data["name"] → KeyError.
-     Fix: the `fields` column selection is now deferred — it runs AFTER the
-     operation dispatch, not before. Each operation branch works on the full
-     filtered/sorted dataframe and the field narrowing happens at the very end
-     for 'rows' only. The compare branch always has access to 'name'.
-
-  2. "whats my name" / profile-read queries now get a useful answer.
-     The router demotes these to RAG (see router.py fix). The Answer LLM
-     prompt already injects the stored profile, so it can answer "your name
-     is shaheer" from the profile block. No pipeline change needed for this —
-     the RAG route with empty evidence_parts already has a fallback, but we
-     also add the profile block injection in the answer system prompt which
-     was already there. Verified this path works correctly.
-
-  3. Display label map in _summarise_csv_result is now built from the live
-     dataframe columns so it never shows "N/A" for every column when the CSV
-     uses non-standard names. All columns present in the row are displayed
-     using their actual column name as label if no friendly name is defined.
-
-Changes in this version (anti-hallucination):
-  4. execute_plan() RAG branch — CSV fallback completely removed.
-     When rag_engine.retrieve() returns no hits (or hits exist but total
-     content is < 500 characters), a direct_answer is set immediately and
-     the LLM is never called. This prevents the model from hallucinating
-     when retrieved context is absent or too thin to be reliable.
-     Execution log now records hybrid_search flag, hit count, and whether
-     the sparse-evidence guard was triggered.
-
-  5. generate_final_answer() — direct_answer short-circuit was already in
-     place; verified it fires before any LLM call when direct_answer is set.
-     Also fires when evidence_parts is empty, returning a static fallback.
-"""
 
 from __future__ import annotations
 
@@ -625,7 +583,7 @@ def generate_final_answer(
     })
 
     try:
-        return llm.chat(messages, max_new_tokens=_ANSWER_TOKENS, temperature=0.1)
+        return llm.chat(messages, max_new_tokens=_ANSWER_TOKENS, temperature=0.0)
     except Exception as e:
         return f"⚠️ Generation error: {e}"
 

@@ -15,6 +15,7 @@ import chainlit as cl
 from pipeline import get_pipeline
 
 
+
 # ── Authentication ─────────────────────────────────────────────────────────────
 # Hardcoded credentials for local development only.
 _HARDCODED_USERS = {

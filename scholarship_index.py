@@ -22,7 +22,7 @@ Changes in this version (hybrid search + score threshold):
   - BM25 index (rank_bm25.BM25Okapi) built alongside FAISS in _build_index().
   - retrieve() now performs hybrid search:
       * Candidate pool = union of top FAISS indices and top BM25 indices.
-      * Hybrid score   = 0.6 * semantic_score + 0.4 * bm25_normalized_score.
+      * Hybrid score   = 0.5 * semantic_score + 0.5 * bm25_normalized_score.
       * BM25 normalization guard: divide by bm25_max only when bm25_max > 1.0;
         when bm25_max <= 1.0 raw scores are used as-is; division by zero is guarded.
   - min_score parameter added to retrieve() (read from config key rag_min_score,
@@ -261,7 +261,7 @@ class RAGEngine:
 
     Hybrid retrieval:
       - Candidate pool  = union of top-FAISS indices and top-BM25 indices.
-      - Hybrid score    = 0.6 * semantic_score + 0.4 * bm25_normalized_score.
+      - Hybrid score    = 0.5 * semantic_score + 0.5 * bm25_normalized_score.
       - min_score gate  = discard chunks below the hybrid score threshold.
     """
 
@@ -287,22 +287,77 @@ class RAGEngine:
         chunk_words: int,
         overlap: int,
     ) -> list[Chunk]:
-        words  = text.split()
+        import re
+
+        # Split text into sentences first for sentence-aware chunking
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+
         result = []
-        start  = 0
-        idx    = 0
-        while start < len(words):
-            end        = min(start + chunk_words, len(words))
-            chunk_text = " ".join(words[start:end])
+        idx = 0
+        current_chunk_sentences = []
+        current_word_count = 0
+
+        for sentence in sentences:
+            sentence_words = sentence.split()
+            sentence_len = len(sentence_words)
+
+            # If a single sentence exceeds chunk_words, split at word boundary
+            if sentence_len > chunk_words:
+                step = max(chunk_words - overlap, 1)
+                for word_start in range(0, sentence_len, step):
+                    word_end = min(word_start + chunk_words, sentence_len)
+                    chunk_text = " ".join(sentence_words[word_start:word_end])
+                    full_chunk = f"[{name}]\n{chunk_text}"
+                    result.append(Chunk(
+                        chunk_id         = f"{name.lower().replace(' ', '_')}_{idx}",
+                        scholarship_name = name,
+                        content          = full_chunk,
+                    ))
+                    idx += 1
+                overlap_sentences = []
+                overlap_words = 0
+                for s in reversed(current_chunk_sentences):
+                    wc = len(s.split())
+                    if overlap_words + wc > overlap:
+                        break
+                    overlap_sentences.insert(0, s)
+                    overlap_words += wc
+                current_chunk_sentences = overlap_sentences
+                current_word_count = overlap_words
+            else:
+                if current_word_count + sentence_len > chunk_words and current_chunk_sentences:
+                    chunk_text = " ".join(current_chunk_sentences)
+                    full_chunk = f"[{name}]\n{chunk_text}"
+                    result.append(Chunk(
+                        chunk_id         = f"{name.lower().replace(' ', '_')}_{idx}",
+                        scholarship_name = name,
+                        content          = full_chunk,
+                    ))
+                    idx += 1
+                    overlap_sentences = []
+                    overlap_words = 0
+                    for s in reversed(current_chunk_sentences):
+                        wc = len(s.split())
+                        if overlap_words + wc > overlap:
+                            break
+                        overlap_sentences.insert(0, s)
+                        overlap_words += wc
+                    current_chunk_sentences = overlap_sentences
+                    current_word_count = overlap_words
+
+                current_chunk_sentences.append(sentence)
+                current_word_count += sentence_len
+
+        # Emit any remaining sentences as a final chunk
+        if current_chunk_sentences:
+            chunk_text = " ".join(current_chunk_sentences)
+            full_chunk = f"[{name}]\n{chunk_text}"
             result.append(Chunk(
                 chunk_id         = f"{name.lower().replace(' ', '_')}_{idx}",
                 scholarship_name = name,
-                content          = chunk_text,
+                content          = full_chunk,
             ))
-            if end == len(words):
-                break
-            start += chunk_words - overlap
-            idx   += 1
+
         return result
 
     def _build_index(self):
@@ -367,7 +422,7 @@ class RAGEngine:
         Chunks with a hybrid score below min_score are discarded entirely.
 
         Hybrid scoring:
-          hybrid_score = 0.6 * semantic_score + 0.4 * bm25_normalized_score
+          hybrid_score = 0.5 * semantic_score + 0.5 * bm25_normalized_score
 
         BM25 normalization guard:
           - If bm25_max > 1.0:  normalize by dividing by bm25_max  → [0, 1]
@@ -432,7 +487,7 @@ class RAGEngine:
 
         # ── Hybrid scoring ─────────────────────────────────────────────────────
         hybrid_scores: dict[int, float] = {
-            idx: 0.6 * faiss_scores.get(idx, 0.0) + 0.4 * bm25_norm.get(idx, 0.0)
+            idx: 0.5 * faiss_scores.get(idx, 0.0) + 0.5 * bm25_norm.get(idx, 0.0)
             for idx in candidate_indices
         }
 

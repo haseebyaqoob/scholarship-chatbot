@@ -44,7 +44,7 @@ class LocalLLM:
         self,
         messages: list[dict],
         max_new_tokens: int = 768,
-        temperature: float = 0.3,
+        temperature: float = 0.0,
         use_json_format: bool = False,
     ) -> str:
         """
